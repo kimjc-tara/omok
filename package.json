@@ -1,0 +1,22 @@
+{
+  "name": "legend-of-omok",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DB 없이 즐기는 실시간 2인 오목",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0",
+    "socket.io-client": "^4.8.1"
+  }
+}
