@@ -1,6 +1,7 @@
 import { avatarImage } from './avatars.js';
 import { PROFILES, findProfile } from './profiles.js';
 import { gameMessage } from './game-messages.js';
+import { sessionAuth, navigateWithSession } from './session-navigation.js';
 
 export function startApp(window) {
 const { document, location, history, navigator } = window;
@@ -24,7 +25,11 @@ const url = new URL(location.href);
 const candidateCode = url.searchParams.get('room') || location.hash.slice(1) || location.pathname.match(/^\/game\/([A-Z2-9]{6})\/?$/)?.[1] || storage.read('sessionStorage', 'omok-invite') || '';
 let pendingInvite = /^[A-Z2-9]{6}$/.test(candidateCode.toUpperCase()) ? candidateCode.toUpperCase() : '';
 if (pendingInvite) storage.write('sessionStorage', 'omok-invite', pendingInvite);
+if (pendingInvite && requestedPage === 'home') requestedPage = 'lobby';
+let profileDestination = pendingInvite || ['lobby', 'game'].includes(requestedPage) ? 'lobby' : 'home';
 let room = null;
+let chatMessages = [];
+let chatBusy = false;
 let playerId = null;
 let online = false;
 let busy = false;
@@ -34,7 +39,7 @@ let toastTimer;
 const gameEventDialog = $('game-event-dialog');
 const seenGameEvents = new Set([storage.read('sessionStorage', 'omok-last-game-event')].filter(Boolean));
 let currentGameEvent = null;
-const socket = window.io({ autoConnect: false, auth: { token: storage.read('sessionStorage', 'omok-session') } });
+const socket = window.io({ autoConnect: false, auth: sessionAuth(window) });
 const cells = [];
 const column = (x) => String.fromCharCode(65 + x);
 const coordinate = (x, y) => `${column(x)}${y + 1}`;
@@ -65,17 +70,21 @@ async function request(event, payload = {}) {
 }
 
 function pageFromPath(path) {
+  if (/^\/(home)?\/?$/.test(path)) return 'home';
   if (/^\/game\//.test(path)) return 'game';
-  return /^\/lobby\/?$/.test(path) ? 'lobby' : 'profile';
+  return /^\/(lobby|omok)\/?$/.test(path) ? 'lobby' : 'profile';
 }
 
 function navigate(page, { replace = false, focus = true } = {}) {
   let next = page;
   if (!sessionReady) next = 'profile';
   else if (room) next = 'game';
-  else if ((next === 'lobby' || next === 'game') && !activeProfile) next = 'profile';
+  else if (!activeProfile && next !== 'profile') {
+    profileDestination = next === 'game' ? 'lobby' : next;
+    next = 'profile';
+  }
   else if (next === 'game') next = 'lobby';
-  const path = next === 'game' ? `/game/${room.code}` : next === 'lobby' && pendingInvite ? `/lobby?room=${pendingInvite}` : `/${next}`;
+  const path = next === 'home' ? '/' : next === 'game' ? `/game/${room.code}` : next === 'lobby' && pendingInvite ? `/lobby?room=${pendingInvite}` : `/${next}`;
   if (location.pathname + location.search + location.hash !== path) history[replace || next !== page ? 'replaceState' : 'pushState'](null, '', path);
   const changed = currentPage !== next;
   currentPage = next;
@@ -84,7 +93,8 @@ function navigate(page, { replace = false, focus = true } = {}) {
     if (step.dataset.step === next) step.setAttribute('aria-current', 'step');
     else step.removeAttribute('aria-current');
   }
-  document.title = `오목의 전설 — ${{ profile: '프로필 선택', lobby: '대국실', game: room?.title || '대국' }[next]}`;
+  $('game-journey').hidden = next === 'home' || next === 'profile';
+  document.title = next === 'home' ? '타라미니게임천국' : next === 'profile' ? '프로필 선택 | 타라미니게임천국' : `오목의 전설 — ${{ lobby: '대국실', game: room?.title || '대국' }[next]} | 타라미니게임천국`;
   if (focus && changed) $(`${next}-heading`).focus({ preventScroll: true });
 }
 
@@ -99,6 +109,8 @@ function renderProfile() {
   if (activeProfile) {
     $('active-profile-name').textContent = `${activeProfile.name}님`;
     $('active-profile-avatar').innerHTML = avatarImage(activeProfile.avatar);
+    $('home-profile-name').textContent = `${activeProfile.name}님`;
+    $('home-profile-avatar').innerHTML = avatarImage(activeProfile.avatar);
   }
   $('profile-invite').textContent = pendingInvite ? `초대 ${pendingInvite}` : '';
   $('profile-invite').hidden = !pendingInvite;
@@ -239,7 +251,7 @@ function renderStatus() {
 function renderControls() {
   const preset = findProfile(profile.profileId);
   $('profile-continue').disabled = !online || !sessionReady || busy || !preset;
-  $('profile-continue').textContent = busy && currentPage === 'profile' ? '확인 중' : preset ? '대기실 입장' : '프로필 선택';
+  $('profile-continue').textContent = busy && currentPage === 'profile' ? '확인 중' : preset ? '입장' : '프로필 선택';
   for (const button of $('profile-options').children) button.disabled = busy;
   for (const id of ['create-button', 'join-button', 'refresh-rooms']) $(id).disabled = !online || !sessionReady || busy || !activeProfile;
   $('leave-button').disabled = !online || busy;
@@ -256,7 +268,61 @@ function renderControls() {
   $('rematch-button').textContent = ready ? '상대 동의 대기' : bothOnline ? rematchLabel : '상대 입장 대기';
   $('rematch-button').disabled = !online || busy || ready || !bothOnline;
   renderGameEventActions();
+  renderChatControls();
 }
+
+function renderChatControls() {
+  $('chat-input').disabled = !online || !room || chatBusy;
+  $('chat-send').disabled = !online || !room || chatBusy || !$('chat-input').value.trim();
+}
+
+function renderChat() {
+  const log = $('chat-log');
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  const items = chatMessages.map((message) => {
+    const item = document.createElement('li');
+    item.className = `chat-message${message.playerId === playerId ? ' own' : ''}`;
+    const author = document.createElement('strong');
+    author.textContent = message.name;
+    const text = document.createElement('span');
+    text.textContent = message.text;
+    item.append(author, text);
+    return item;
+  });
+  log.replaceChildren(...items);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+$('chat-input').addEventListener('input', renderChatControls);
+$('chat-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const text = $('chat-input').value.trim();
+  if (!text || !online || !room || chatBusy) return;
+  const code = room.code;
+  chatBusy = true;
+  renderChatControls();
+  try {
+    await new Promise((resolve) => socket.timeout(5000).emit('chat:send', { text }, (error, result) => {
+      if (error || !result?.ok) toast(result?.error || '채팅 전송 실패');
+      else if (room?.code === code) $('chat-input').value = '';
+      resolve();
+    }));
+  } finally {
+    chatBusy = false;
+    renderChatControls();
+    if (room?.code === code) $('chat-input').focus({ preventScroll: true });
+  }
+});
+socket.on('chat:history', ({ roomCode, messages }) => {
+  if (roomCode !== room?.code) return;
+  chatMessages = messages.slice(-50);
+  renderChat();
+});
+socket.on('chat:message', ({ roomCode, message }) => {
+  if (roomCode !== room?.code || chatMessages.some((entry) => entry.id === message.id)) return;
+  chatMessages = [...chatMessages, message].slice(-50);
+  renderChat();
+});
 
 function closeGameEvent() {
   currentGameEvent = null;
@@ -359,6 +425,7 @@ function render() {
 }
 
 function renderLobby(rooms) {
+  rooms = rooms.filter((item) => item.type !== 'seotda');
   $('room-count').textContent = rooms.length;
   $('room-list').replaceChildren();
   if (!rooms.length) {
@@ -371,7 +438,7 @@ function renderLobby(rooms) {
     button.innerHTML = `${avatarImage(item.host.avatar)}<span class="room-item-copy"><strong></strong><small></small></span><span class="room-item-arrow" aria-hidden="true">↗</span>`;
     button.querySelector('strong').textContent = item.title;
     button.querySelector('small').textContent = `${item.host.name} · 1 / 2명`;
-    button.addEventListener('click', () => request('room:join', { code: item.code }));
+    button.addEventListener('click', () => request('room:join', { code: item.code, type: 'omok' }));
     $('room-list').append(button);
   }
   renderControls();
@@ -408,11 +475,20 @@ socket.on('connect_error', (error) => {
   if (!socket.active) { toast(error.message); window.setTimeout(() => socket.connect(), 5000); }
 });
 socket.on('room:state', (next) => {
+  if (next?.type === 'seotda') {
+    navigateWithSession(window, socket, `/seotda/game/${next.code}`, { replace: true }).catch(() => toast('화면 이동 실패. 다시 시도해 주세요.'));
+    return;
+  }
   const oldKey = `${room?.code}/${room?.game.round}/${room?.game.moves.length}/${room?.game.status}`;
   const nextKey = `${next?.code}/${next?.game.round}/${next?.game.moves.length}/${next?.game.status}`;
   if (oldKey !== nextKey) selected = null;
   const wasReady = sessionReady;
   const wasInRoom = Boolean(room);
+  if (room?.code !== next?.code) {
+    chatMessages = [];
+    $('chat-input').value = '';
+    renderChat();
+  }
   room = next;
   sessionReady = true;
   if (room) {
@@ -436,17 +512,36 @@ $('profile-form').addEventListener('submit', async (event) => {
   activeProfile = result.profile;
   profile = { profileId: activeProfile.profileId };
   storage.write('localStorage', 'omok-profile', JSON.stringify(profile));
-  requestedPage = 'lobby';
-  navigate('lobby');
+  requestedPage = profileDestination;
+  navigate(requestedPage);
   render();
 });
 function openProfile() {
   if (room) { toast('대기실에서 변경 가능'); return; }
+  profileDestination = currentPage === 'lobby' ? 'lobby' : 'home';
   requestedPage = 'profile';
   navigate('profile');
 }
-$('home-link').addEventListener('click', (event) => { event.preventDefault(); openProfile(); });
+$('home-link').addEventListener('click', async (event) => {
+  event.preventDefault();
+  if (room) {
+    if (room.game.status === 'playing' && !await confirmAction('쳐발리기전에 도망칠까요?? ㅋㅋ...')) return;
+    if (!await request('room:leave')) return;
+  }
+  requestedPage = 'home';
+  navigate('home');
+});
+$('omok-entry').addEventListener('click', (event) => {
+  event.preventDefault();
+  requestedPage = 'lobby';
+  navigate('lobby');
+});
+$('seotda-entry').addEventListener('click', (event) => {
+  event.preventDefault();
+  navigateWithSession(window, socket, '/seotda').catch(() => toast('화면 이동 실패. 다시 시도해 주세요.'));
+});
 $('change-profile').addEventListener('click', openProfile);
+$('home-change-profile').addEventListener('click', openProfile);
 function onPopState() {
   requestedPage = pageFromPath(location.pathname);
   navigate(requestedPage, { replace: true });
@@ -459,7 +554,7 @@ $('create-form').addEventListener('submit', async (event) => {
 });
 $('join-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  await request('room:join', { code: $('room-code').value });
+  await request('room:join', { code: $('room-code').value, type: 'omok' });
 });
 $('refresh-rooms').addEventListener('click', async () => {
   const result = await request('lobby:list');
@@ -504,7 +599,7 @@ $('copy-code').addEventListener('click', () => copy(room.code, '코드 복사됨
 $('copy-link').addEventListener('click', () => copy(`${location.origin}/lobby?room=${room.code}`, '링크 복사됨'));
 if (pendingInvite) $('room-code').value = pendingInvite;
 const statusTimer = window.setInterval(renderStatus, 1000);
-navigate('profile', { replace: true, focus: false });
+navigate(requestedPage, { replace: true, focus: false });
 render();
 socket.connect();
 return {

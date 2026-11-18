@@ -25,7 +25,7 @@ async function fixture(t) {
     for (const client of clients) { client.app.destroy(); client.window.close(); }
     await server.close();
   });
-  async function open(path = '/', { session = {}, local = {} } = {}) {
+  async function open(path = '/profile', { session = {}, local = {} } = {}) {
     const dom = new JSDOM(html, { url: origin + path });
     const { window } = dom;
     // jsdom has dialog elements but no native top-layer implementation.
@@ -52,15 +52,16 @@ async function fixture(t) {
     client.click = (selector) => {
       const button = client.document.querySelector(selector);
       assert.ok(button, `Element exists: ${selector}`);
-      assert.equal(button.disabled, false, `Element is enabled: ${selector}`);
+      assert.notEqual(button.disabled, true, `Element is enabled: ${selector}`);
       button.click();
     };
-    client.choose = async (profileId) => {
+    client.choose = async (profileId, { enterOmok = true } = {}) => {
       client.click(`[data-profile-id="${profileId}"]`);
       await waitFor(() => !client.get('profile-continue').disabled, 'profile selection ready');
       client.click('#profile-continue');
-      await waitFor(() => client.window.location.pathname === '/lobby', 'profile opens lobby');
-      assert.deepEqual(client.visible(), ['lobby']);
+      await waitFor(() => client.get('profile-page').hidden, 'profile selection completed');
+      if (enterOmok && !client.get('home-page').hidden) client.click('#omok-entry');
+      assert.deepEqual(client.visible(), [enterOmok ? 'lobby' : 'home']);
     };
     clients.push(client);
     await waitFor(() => window.sessionStorage.getItem('omok-session'), 'server session');
@@ -84,17 +85,87 @@ async function fixture(t) {
   return { open, pair };
 }
 
-test('profile page offers four fixed names; selecting a name opens the separate lobby', async (t) => {
+test('first entry selects a profile before the game catalog; home keeps the selected profile', async (t) => {
+  const { open } = await fixture(t);
+  const client = await open('/');
+  assert.deepEqual(client.visible(), ['profile']);
+  assert.equal(client.get('game-journey').hidden, true);
+  assert.equal(client.document.title, '프로필 선택 | 타라미니게임천국');
+  client.click('#home-link');
+  assert.deepEqual(client.visible(), ['profile'], 'home cannot bypass profile selection');
+  await client.choose('donghyeon', { enterOmok: false });
+  assert.deepEqual(client.visible(), ['home']);
+  assert.equal(client.get('home-profile-name').textContent, '동현님');
+  assert.equal(client.document.title, '타라미니게임천국');
+  assert.equal(client.get('game-journey').hidden, true);
+  assert.equal(client.document.querySelectorAll('.catalog-game').length, 4);
+  assert.equal(client.get('seotda-entry').getAttribute('href'), '/seotda');
+  assert.equal(client.get('seotda-entry').classList.contains('available'), true);
+  client.click('#home-change-profile');
+  await client.choose('jiwon', { enterOmok: false });
+  assert.equal(client.get('home-profile-name').textContent, '지원님');
+  assert.equal(client.get('home-profile-avatar').querySelector('img').getAttribute('src'), '/assets/avatars/jiwon.png');
+  client.click('#omok-entry');
+  assert.deepEqual(client.visible(), ['lobby']);
+  assert.equal(client.get('active-profile-name').textContent, '지원님');
+  client.click('#home-link');
+  assert.deepEqual(client.visible(), ['home']);
+  client.click('#omok-entry');
+  assert.deepEqual(client.visible(), ['lobby']);
+  client.click('#create-button');
+  await waitFor(() => client.window.location.pathname.startsWith('/game/'));
+  client.click('#home-link');
+  await waitFor(() => client.window.location.pathname === '/');
+  assert.deepEqual(client.visible(), ['home']);
+  assert.equal(client.get('chat-input').disabled, true);
+});
+
+test('room chat sends between players as plain text without changing the board', async (t) => {
+  const { pair } = await fixture(t);
+  const { a, b } = await pair();
+  const text = '<img src=x onerror="alert(1)"> 안녕';
+  a.get('chat-input').value = text;
+  a.get('chat-input').dispatchEvent(new a.window.Event('input'));
+  a.click('#chat-send');
+  await waitFor(() => b.get('chat-log').textContent.includes(text));
+  assert.equal(b.get('chat-log').querySelector('img'), null);
+  assert.equal(b.get('chat-log').querySelector('strong').textContent, '주찬');
+  await waitFor(() => a.get('chat-input').value === '');
+  b.get('chat-input').value = 'ㄱㄱ';
+  b.get('chat-input').dispatchEvent(new b.window.Event('input'));
+  b.click('#chat-send');
+  await waitFor(() => a.get('chat-log').children.length === 2);
+  assert.equal(a.get('round-label').textContent, '1번째 판 · 0수');
+  assert.equal(a.get('status-title').textContent, '내 차례');
+});
+
+test('direct Omok entry still requires a profile; refreshing home restores the chosen profile', async (t) => {
+  const { open } = await fixture(t);
+  const client = await open('/omok', { local: { 'omok-profile': JSON.stringify({ profileId: 'minseo' }) } });
+  assert.deepEqual(client.visible(), ['profile']);
+  assert.equal(client.document.querySelector('[data-profile-id="minseo"]').getAttribute('aria-pressed'), 'true');
+  await client.choose('minseo');
+  client.click('#home-link');
+  const session = Object.fromEntries(Object.entries(client.window.sessionStorage));
+  client.app.destroy();
+  const refreshed = await open('/', { session });
+  await waitFor(() => !refreshed.get('home-page').hidden);
+  assert.equal(refreshed.get('home-profile-name').textContent, '민서님');
+  assert.equal(refreshed.get('home-profile-avatar').querySelector('img').getAttribute('src'), '/assets/avatars/minseo.png');
+});
+
+test('profile page offers seven fixed name/avatar pairs shared by home and Omok', async (t) => {
   const { open } = await fixture(t);
   const client = await open();
   assert.deepEqual(client.visible(), ['profile']);
   assert.equal(client.window.location.pathname, '/profile');
   assert.equal(client.get('profile-continue').disabled, true);
-  assert.deepEqual([...client.document.querySelectorAll('.profile-option strong')].map((el) => el.textContent), ['주찬', '경후', '강희', '용환']);
+  assert.deepEqual([...client.document.querySelectorAll('.profile-option strong')].map((el) => el.textContent), ['주찬', '경후', '강희', '용환', '동현', '지원', '민서']);
   assert.equal(client.document.querySelector('input[autocomplete="nickname"]'), null);
   assert.equal(client.get('avatar-options'), null);
   assert.deepEqual([...client.document.querySelectorAll('.profile-face img')].map((el) => el.getAttribute('src')), [
     '/assets/avatars/juchan.png', '/assets/avatars/gyeonghu.png', '/assets/avatars/ganghui.png', '/assets/avatars/yonghwan.png',
+    '/assets/avatars/donghyeon.png', '/assets/avatars/jiwon.png', '/assets/avatars/minseo.png',
   ]);
   await client.choose('gyeonghu');
   assert.equal(client.get('active-profile-name').textContent, '경후님');
@@ -109,6 +180,10 @@ test('profile page offers four fixed names; selecting a name opens the separate 
   await client.choose('yonghwan');
   assert.equal(client.get('active-profile-name').textContent, '용환님');
   assert.equal(client.get('active-profile-avatar').querySelector('img').getAttribute('src'), '/assets/avatars/yonghwan.png');
+  client.click('#change-profile');
+  await client.choose('minseo');
+  assert.equal(client.get('active-profile-name').textContent, '민서님');
+  assert.equal(client.get('active-profile-avatar').querySelector('img').getAttribute('src'), '/assets/avatars/minseo.png');
 });
 
 test('two page instances create/join a room and play, without showing lobby forms in the game', async (t) => {
@@ -266,6 +341,10 @@ test('invitation survives the required profile selection and a profile-page refr
   host.click('#create-button');
   await waitFor(() => host.window.location.pathname.startsWith('/game/'));
   const code = host.get('invite-code').textContent;
+  const rootInvite = await open(`/?room=${code}`);
+  await rootInvite.choose('donghyeon');
+  assert.equal(rootInvite.get('room-code').value, code);
+  assert.equal(rootInvite.window.location.search, `?room=${code}`);
   const invited = await open(`/lobby?room=${code}`);
   assert.deepEqual(invited.visible(), ['profile']);
   assert.equal(invited.get('room-code').value, code);
